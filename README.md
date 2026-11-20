@@ -47,6 +47,16 @@ The local timing requires the starter image's `/usr/local/bin/python`, adds a sm
 Compare on the same machine without overlapping runs.
 Use `make sample-full IMAGE=blast-radius-claude` in Claude's worktree and `make sample-full IMAGE=blast-radius-codex` in Codex's worktree.
 
+## Static selector
+
+The selector maps changed paths to test files, selects every test in those files, and keeps the starter's three-worker scheduling.
+The index follows Python imports transitively, includes package initializers, and adds static links for lazy dialect references and SQL fixtures.
+An unknown or unsupported patch path falls back to the full test suite.
+The index is built from a clean checkout of the pinned sqlglot revision and does not use sample patches, test IDs or failure labels.
+
+To regenerate the index, run `python3 build_dependencies.py /path/to/sqlglot dependencies.json` with the pinned checkout.
+The Docker build copies the precomputed index, so the selector needs no network or sqlglot installation at runtime.
+
 ## Submit
 
 Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.
