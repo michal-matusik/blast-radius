@@ -1,0 +1,7 @@
+.worktrees/
+output.jsonl
+__pycache__/
+.venv/
+.pytest_cache/
+.env
+.env.*
