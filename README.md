@@ -51,7 +51,8 @@ Use `make sample-full IMAGE=blast-radius-claude` in Claude's worktree and `make 
 
 The selector maps changed paths to test files and selects every test in those files.
 For each commit, it tries up to eight workers by assigning the longest tests first to the least loaded worker.
-It picks the schedule with the lowest busiest-worker time plus two seconds per worker, using fewer workers on ties.
+It prices each candidate using busiest-worker time plus two seconds per worker.
+A bounded balancing pass moves or swaps tests between the heaviest and lightest workers.
 The index follows Python imports transitively, includes package initializers, and adds static links for lazy dialect references and SQL fixtures.
 For edits wholly inside indexed top-level function bodies, the selector can use a narrower set of test files.
 The function index follows sibling references and statically resolved named imports or module attributes.
@@ -77,6 +78,19 @@ Pass an output path outside that source archive.
 ```sh
 python trace_generator_methods.py /path/to/pinned-source /path/to/generator_coverage.json
 ```
+
+## Probabilistic scheduling
+
+For trace-qualified edits, the planner gives every candidate test a failure probability based on the failure scenarios it belongs to.
+A changed generator symbol defines a shared cause among its observed callers.
+Missing coverage contributes one shared gap scenario and one additional scenario per test file.
+A group that loses several tests incurs one modeled risk for that cause.
+Across causes the model assumes independence and estimates the chance of any omitted failure as one minus the product of the probabilities that the relevant causes do not occur.
+These probabilities are conservative policy priors rather than measured or trained frequencies.
+
+The planner retains tests required by static evidence and considers a bounded set of omissions ordered by marginal risk per unit of duration.
+It compares worker assignments by estimated CI time plus 300 seconds times the probability of missing any failure.
+Sample answers are used only by the official benchmark.
 
 ## Submit
 

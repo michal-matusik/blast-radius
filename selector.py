@@ -6,6 +6,7 @@ from math import floor
 from pathlib import Path
 
 from generator_selection import generator_groups
+from probabilistic import plan
 
 DATA = Path("/data")
 DEPENDENCIES = Path(__file__).with_name("dependencies.json")
@@ -93,7 +94,7 @@ def symbol_consumers(lines, spans):
     return affected if saw_edit and old_left == new_left == 0 else None
 
 
-def select(patch: bytes, tests: list[dict], dependencies: dict, coverage=None) -> list[dict]:
+def selection_evidence(patch: bytes, tests: list[dict], dependencies: dict, coverage=None):
     by_path = dependencies["test_files_by_path"]
     by_symbol = dependencies.get("symbols_by_path", {})
     by_method = dependencies.get("methods_by_path", {})
@@ -102,14 +103,15 @@ def select(patch: bytes, tests: list[dict], dependencies: dict, coverage=None) -
     affected = set()
     unmeasured_files = set()
     covered_tests = set()
+    observed_groups = []
     catalog_ids = None
     for start, end in zip(headers, headers[1:] + [len(lines)]):
         match = DIFF_HEADER.fullmatch(lines[start])
         if not match:
-            return tests
+            return tests, {test['id'] for test in tests}, []
         old, new = (path.decode("utf-8", errors="replace") for path in match.groups())
         if old not in by_path or new not in by_path:
-            return tests
+            return tests, {test['id'] for test in tests}, []
         if old == new and coverage and old in coverage["files"]:
             groups = generator_groups(lines[start + 1:end], coverage["files"][old])
             if groups is not None:
@@ -118,6 +120,7 @@ def select(patch: bytes, tests: list[dict], dependencies: dict, coverage=None) -
                 consumers = [catalog_ids.intersection(coverage["groups"][group]) for group in groups]
                 if all(consumers):
                     covered_tests.update(*consumers)
+                    observed_groups.extend(consumers)
                     unmeasured_files.update(by_path[old])
                     continue
         spans = [*by_symbol.get(old, ()), *by_method.get(old, ())]
@@ -136,7 +139,10 @@ def select(patch: bytes, tests: list[dict], dependencies: dict, coverage=None) -
         or (covered_tests and test["id"] in covered_tests)
         or (test["file"] in unmeasured_files and test["id"] not in measured)
     ]
-    return selected or tests
+    if not selected:
+        return tests, {test["id"] for test in tests}, []
+    required = {test["id"] for test in selected if test["file"] in affected}
+    return selected, required, observed_groups
 
 
 def main() -> None:
@@ -147,8 +153,8 @@ def main() -> None:
         raise ValueError("Static index and generator coverage use different revisions")
     coverage["measured"] = set(coverage["measured"])
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        selected = select(patch.read_bytes(), tests, dependencies, coverage)
-        workers = schedule(selected)
+        selected, required, observed = selection_evidence(patch.read_bytes(), tests, dependencies, coverage)
+        workers = plan(selected, required, observed, schedule)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
 
 
