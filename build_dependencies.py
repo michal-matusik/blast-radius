@@ -20,15 +20,18 @@ def module_name(path):
     return ".".join(parts)
 
 
+def import_base(node, package):
+    base = node.module or ""
+    return resolve_name("." * node.level + base, package) if node.level else base
+
+
 def imports(tree, module, package, modules, dialects):
     edges = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             edges.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            base = node.module or ""
-            if node.level:
-                base = resolve_name("." * node.level + base, package)
+            base = import_base(node, package)
             edges.add(base)
             for alias in node.names:
                 candidate = f"{base}.{alias.name}"
@@ -91,6 +94,102 @@ def closure(seeds, graph):
     return visited
 
 
+def loaded_names(node):
+    return {
+        item.id for item in ast.walk(node)
+        if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load)
+    }
+
+
+def dotted_name(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = dotted_name(node.value)
+        if prefix:
+            return f"{prefix}.{node.attr}"
+    return None
+
+
+def imported_symbols(tree, module, package, names):
+    named = set()
+    qualified = set()
+    nodes = list(ast.walk(tree))
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            qualified.update(alias.asname or module for alias in node.names if alias.name == module)
+        elif isinstance(node, ast.ImportFrom):
+            base = import_base(node, package)
+            if base == module:
+                named.update(alias.name for alias in node.names)
+            else:
+                qualified.update(
+                    alias.asname or alias.name for alias in node.names
+                    if f"{base}.{alias.name}" == module
+                )
+    if qualified:
+        parents = {id(child): node for node in nodes for child in ast.iter_child_nodes(node)}
+        for node in nodes:
+            if not isinstance(node, (ast.Attribute, ast.Name)) or dotted_name(node) not in qualified:
+                continue
+            parent = parents.get(id(node))
+            if not isinstance(parent, ast.Attribute) or parent.value is not node:
+                return None  # Module value escapes static attribute resolution.
+            named.add(parent.attr)
+    return named if named and named <= names else None
+
+
+def symbol_index(modules, trees, packages, graphs, index, test_dependencies):
+    result = {}
+    for module, path in modules.items():
+        if not path.startswith("sqlglot/") or path.endswith("/__init__.py"):
+            continue
+        functions = {
+            node.name: node for node in trees[module].body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not node.decorator_list
+        }
+        if len(functions) < 2 or path not in index:
+            continue
+        names = functions.keys()
+        # Module-scope uses include registries, aliases, classes and decorators.
+        # Those references cannot be separated from importing the module.
+        module_uses = set()
+        for node in trees[module].body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name not in names:
+                module_uses.update(loaded_names(node))
+            else:
+                module_uses.update(loaded_names(node.args))
+                if node.returns:
+                    module_uses.update(loaded_names(node.returns))
+        calls = {name: loaded_names(node) & names for name, node in functions.items()}
+
+        references = {}
+        for importer, edges in graphs.items():
+            if module not in edges:
+                continue
+            named = imported_symbols(trees[importer], module, packages[importer], names)
+            references[importer] = closure(named, calls) if named else names
+
+        spans = []
+        for name, function in functions.items():
+            if name in closure(module_uses & names, calls):
+                continue
+            consumers = sorted(
+                test_path for test_path in index[path]
+                if any(name in references.get(dependency, ()) for dependency in test_dependencies[test_path])
+            )
+            # No evidence is not evidence of no affected tests.
+            if not consumers or len(consumers) == len(index[path]):
+                continue
+            first = function.body[0].lineno
+            if first > function.lineno:
+                spans.append([first, function.end_lineno, consumers])
+        if spans:
+            result[path] = spans
+    return result
+
+
 def build(root):
     modules = {
         module_name(path.relative_to(root).as_posix()): path.relative_to(root).as_posix()
@@ -106,10 +205,14 @@ def build(root):
         for module in modules
         if module.startswith(DIALECT_PACKAGE + ".") and module != DIALECT_PACKAGE + ".dialect"
     }
-    graphs = {}
-    for module, path in modules.items():
-        package = module if path.endswith("/__init__.py") else module.rpartition(".")[0]
-        graphs[module] = imports(trees[module], module, package, modules, dialects)
+    packages = {
+        module: module if path.endswith("/__init__.py") else module.rpartition(".")[0]
+        for module, path in modules.items()
+    }
+    graphs = {
+        module: imports(tree, module, packages[module], modules, dialects)
+        for module, tree in trees.items()
+    }
     fixtures = {
         path.relative_to(root).as_posix()
         for path in (root / FIXTURES).rglob("*")
@@ -121,16 +224,22 @@ def build(root):
         if module.startswith("tests.")
     }
     index = {}
+    test_dependencies = {}
     for module, test_path in sorted(modules.items()):
         if not test_path.startswith("tests/") or not Path(test_path).name.startswith("test_"):
             continue
         dependencies = closure({module} | test_dialects(trees[module], module, dialects), graphs)
+        test_dependencies[test_path] = dependencies
         paths = {modules[dependency] for dependency in dependencies}
         for dependency in dependencies:
             paths.update(fixture_edges.get(dependency, ()))
         for path in paths:
             index.setdefault(path, []).append(test_path)
-    return {"revision": REVISION, "test_files_by_path": index}
+    return {
+        "revision": REVISION,
+        "test_files_by_path": index,
+        "symbols_by_path": symbol_index(modules, trees, packages, graphs, index, test_dependencies),
+    }
 
 
 def main():
