@@ -40,7 +40,7 @@ def schedule(tests: list[dict]) -> list[list[int]]:
 
 
 def symbol_consumers(lines, spans):
-    """Return None unless every edit lies inside indexed function bodies."""
+    """Return None unless every edit lies inside indexed function or method bodies."""
     affected = set()
     old = old_left = new_left = 0
     saw_edit = False
@@ -69,10 +69,13 @@ def symbol_consumers(lines, spans):
             saw_edit = True
             # Insertions must be between body lines, not at a symbol boundary.
             first = old - (marker == b"+")
-            if marker == b"+" and line[1:].strip() and not line[1:].startswith((b" ", b"\t")):
-                return None
-            for start, end, consumers in spans:
+            for start, end, consumers, *minimum_indent in spans:
                 if start <= first <= old <= end:
+                    content = line[1:]
+                    if marker == b"+" and content.strip():
+                        indent = len(content) - len(content.lstrip(b" \t"))
+                        if indent < (minimum_indent[0] if minimum_indent else 1):
+                            return None
                     affected.update(consumers)
                     break
             else:
@@ -90,6 +93,7 @@ def symbol_consumers(lines, spans):
 def select(patch: bytes, tests: list[dict], dependencies: dict) -> list[dict]:
     by_path = dependencies["test_files_by_path"]
     by_symbol = dependencies.get("symbols_by_path", {})
+    by_method = dependencies.get("methods_by_path", {})
     lines = patch.splitlines()
     headers = [i for i, line in enumerate(lines) if line.startswith(b"diff --git ")]
     affected = set()
@@ -100,8 +104,9 @@ def select(patch: bytes, tests: list[dict], dependencies: dict) -> list[dict]:
         old, new = (path.decode("utf-8", errors="replace") for path in match.groups())
         if old not in by_path or new not in by_path:
             return tests
-        if old == new and old in by_symbol:
-            consumers = symbol_consumers(lines[start + 1:end], by_symbol[old])
+        spans = [*by_symbol.get(old, ()), *by_method.get(old, ())]
+        if old == new and spans:
+            consumers = symbol_consumers(lines[start + 1:end], spans)
             if consumers is not None:
                 affected.update(consumers)
                 continue

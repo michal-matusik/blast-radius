@@ -139,6 +139,143 @@ def imported_symbols(tree, module, package, names):
     return named if named and named <= names else None
 
 
+def symbol_references(module, trees, packages, graphs, calls):
+    names = calls.keys()
+    references = {}
+    for importer, edges in graphs.items():
+        if module in edges:
+            named = imported_symbols(trees[importer], module, packages[importer], names)
+            references[importer] = closure(named, calls) if named else names
+    return references
+
+
+def symbol_test_files(name, file_tests, test_dependencies, references):
+    consumers = [
+        path for path in file_tests
+        if any(name in references.get(dependency, ()) for dependency in test_dependencies[path])
+    ]
+    # Preserve the file fallback when consumers are unknown or indistinguishable.
+    return sorted(consumers) if 0 < len(consumers) < len(file_tests) else []
+
+
+def method_test_dependencies(modules, trees, packages, graphs, dialects, tests):
+    """Avoid attributing sibling test classes to a consumer of the shared Validator."""
+    helper = "tests.dialects.test_dialect"
+    if helper not in trees:
+        return tests
+    tree = trees[helper]
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+    if "Validator" not in classes:
+        return tests
+    # Keep the helper's bodies, eager module code, and everything evaluated
+    # when sibling classes are defined. Sibling test method bodies do not run.
+    scope = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name != "Validator":
+            scope.extend([*node.bases, *node.keywords, *node.decorator_list])
+            for member in node.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    scope.extend([*member.decorator_list, member.args])
+                    if member.returns:
+                        scope.append(member.returns)
+                else:
+                    scope.append(member)
+        else:
+            scope.append(node)
+    names = loaded_names(ast.Module(body=scope, type_ignores=[]))
+    filtered = []
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module and (
+            node.module == DIALECT_PACKAGE
+            or node.module.startswith((DIALECT_PACKAGE + ".", "sqlglot.parsers.", "sqlglot.generators."))
+        ):
+            aliases = [
+                alias for alias in node.names
+                if (alias.asname or alias.name) in names or alias.name == "*"
+            ]
+            if aliases:
+                filtered.append(ast.ImportFrom(module=node.module, names=aliases, level=node.level))
+        else:
+            filtered.append(node)
+    # Keep every other import unchanged, including helper calls and fixtures.
+    helper_edges = imports(ast.Module(body=filtered, type_ignores=[]), helper,
+                           packages[helper], modules, dialects)
+    if helper_edges == graphs[helper]:
+        return tests
+    scoped_graph = {**graphs, helper: helper_edges}
+
+    result = {}
+    for path, dependencies in tests.items():
+        test = module_name(path)
+        importers = {module for module in dependencies if helper in graphs[module]}
+        if test == helper or not importers or any(
+            imported_symbols(trees[module], helper, packages[module], classes.keys()) != {"Validator"}
+            for module in importers
+        ):
+            result[path] = dependencies
+        else:
+            result[path] = closure({test} | test_dialects(trees[test], test, dialects), scoped_graph)
+    return result
+
+
+def method_index(modules, trees, packages, graphs, index, test_dependencies, root):
+    """Resolve method consumers through the owning class and its relationships."""
+    result = {}
+    for module, path in modules.items():
+        if not path.startswith(("sqlglot/parsers/", "sqlglot/generators/")) or path not in index:
+            continue
+        tree = trees[module]
+        definitions = {
+            node.name: node for node in tree.body
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        classes = {
+            name: node for name, node in definitions.items()
+            if isinstance(node, ast.ClassDef) and not (node.decorator_list or node.keywords)
+        }
+        if not classes:
+            continue
+        # An exported function, sibling class, or subclass can reach the owner.
+        # Keep dependencies even when an override exists: it can delegate via super().
+        names = definitions.keys()
+        calls = {name: loaded_names(node) & names for name, node in definitions.items()}
+        references = symbol_references(module, trees, packages, graphs, calls)
+        module_uses = set()
+        for node in tree.body:
+            if node not in definitions.values():
+                module_uses.update(loaded_names(node))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for expression in [*node.decorator_list, node.args, node.returns]:
+                    if expression:
+                        module_uses.update(loaded_names(expression))
+            elif node.decorator_list or node.keywords:
+                module_uses.update(loaded_names(node))
+        eager = closure(module_uses & names, calls)
+
+        spans = []
+        for name, owner in classes.items():
+            if name in eager:
+                continue
+            consumers = symbol_test_files(name, index[path], test_dependencies, references)
+            if not consumers:
+                continue
+            source = (root / path).read_bytes().splitlines()
+            for node in owner.body:
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if node.decorator_list or node.name.startswith("__") or node.body[0].lineno <= node.lineno:
+                    continue
+                first = node.body[0].lineno
+                # Require inserted code to stay below the method's signature
+                # indentation. A dedent could change the surrounding class.
+                signature = source[node.lineno - 1]
+                indent = len(signature) - len(signature.lstrip(b" \t"))
+                spans.append([first, node.end_lineno, consumers, indent + 1])
+        if spans:
+            result[path] = spans
+    return result
+
+
 def symbol_index(modules, trees, packages, graphs, index, test_dependencies):
     result = {}
     for module, path in modules.items():
@@ -164,23 +301,14 @@ def symbol_index(modules, trees, packages, graphs, index, test_dependencies):
                     module_uses.update(loaded_names(node.returns))
         calls = {name: loaded_names(node) & names for name, node in functions.items()}
 
-        references = {}
-        for importer, edges in graphs.items():
-            if module not in edges:
-                continue
-            named = imported_symbols(trees[importer], module, packages[importer], names)
-            references[importer] = closure(named, calls) if named else names
+        references = symbol_references(module, trees, packages, graphs, calls)
 
         spans = []
         for name, function in functions.items():
             if name in closure(module_uses & names, calls):
                 continue
-            consumers = sorted(
-                test_path for test_path in index[path]
-                if any(name in references.get(dependency, ()) for dependency in test_dependencies[test_path])
-            )
-            # No evidence is not evidence of no affected tests.
-            if not consumers or len(consumers) == len(index[path]):
+            consumers = symbol_test_files(name, index[path], test_dependencies, references)
+            if not consumers:
                 continue
             first = function.body[0].lineno
             if first > function.lineno:
@@ -239,6 +367,11 @@ def build(root):
         "revision": REVISION,
         "test_files_by_path": index,
         "symbols_by_path": symbol_index(modules, trees, packages, graphs, index, test_dependencies),
+        "methods_by_path": method_index(
+            modules, trees, packages, graphs, index,
+            method_test_dependencies(modules, trees, packages, graphs, dialects, test_dependencies),
+            root,
+        ),
     }
 
 

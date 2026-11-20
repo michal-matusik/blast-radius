@@ -56,6 +56,8 @@ The index follows Python imports transitively, includes package initializers, an
 For edits wholly inside indexed top-level function bodies, the selector can use a narrower set of test files.
 The function index follows sibling references and statically resolved named imports or module attributes.
 It retains file-level selection for dynamic or unresolved uses, unsupported edits, and functions without a distinct set of known consumers.
+For dialect parser and generator methods, the index follows the owning class and retains references through base classes, sibling classes, and exported functions.
+When static analysis cannot distinguish which tests reach the owner, or an edit can change class structure, the selector retains file-level selection.
 An unknown or unsupported patch path falls back to the full test suite.
 The index is built from a clean checkout of the pinned sqlglot revision and does not use sample patches, test IDs or failure labels.
 
