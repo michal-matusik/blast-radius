@@ -58,11 +58,25 @@ The function index follows sibling references and statically resolved named impo
 It retains file-level selection for dynamic or unresolved uses, unsupported edits, and functions without a distinct set of known consumers.
 For dialect parser and generator methods, the index follows the owning class and retains references through base classes, sibling classes, and exported functions.
 When static analysis cannot distinguish which tests reach the owner, or an edit can change class structure, the selector retains file-level selection.
+The generator selector also uses per-test call traces from the pinned, unpatched dialect test suite.
+It handles edits inside generator method bodies and top-level dispatch helpers, validates the hunk against the original source, and checks that the result compiles.
+The embedded source is covered by [SQLGLOT-LICENSE](SQLGLOT-LICENSE).
+It keeps observed consumers and retains static selection for test IDs without usable coverage.
+Import-time code, unobserved symbols and structural edits retain the static fallback.
+Coverage reflects the baseline run and can miss calls that only occur under a different test environment.
+
 An unknown or unsupported patch path falls back to the full test suite.
 The index is built from a clean checkout of the pinned sqlglot revision and does not use sample patches, test IDs or failure labels.
 
 To regenerate the index, run `python3 build_dependencies.py /path/to/sqlglot dependencies.json` with the pinned checkout.
 The Docker build copies the precomputed index, so the selector needs no network or sqlglot installation at runtime.
+
+To regenerate the trace, install `requirements.lock` in Python 3.13 using the starter Docker image, then run the tracer against a Git archive of the pinned revision.
+Pass an output path outside that source archive.
+
+```sh
+python trace_generator_methods.py /path/to/pinned-source /path/to/generator_coverage.json
+```
 
 ## Submit
 

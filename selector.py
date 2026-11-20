@@ -5,8 +5,11 @@ import re
 from math import floor
 from pathlib import Path
 
+from generator_selection import generator_groups
+
 DATA = Path("/data")
 DEPENDENCIES = Path(__file__).with_name("dependencies.json")
+GENERATOR_COVERAGE = Path(__file__).with_name("generator_coverage.json")
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 DIFF_HEADER = re.compile(rb"diff --git a/(\S+) b/(\S+)")
@@ -90,13 +93,16 @@ def symbol_consumers(lines, spans):
     return affected if saw_edit and old_left == new_left == 0 else None
 
 
-def select(patch: bytes, tests: list[dict], dependencies: dict) -> list[dict]:
+def select(patch: bytes, tests: list[dict], dependencies: dict, coverage=None) -> list[dict]:
     by_path = dependencies["test_files_by_path"]
     by_symbol = dependencies.get("symbols_by_path", {})
     by_method = dependencies.get("methods_by_path", {})
     lines = patch.splitlines()
     headers = [i for i, line in enumerate(lines) if line.startswith(b"diff --git ")]
     affected = set()
+    unmeasured_files = set()
+    covered_tests = set()
+    catalog_ids = None
     for start, end in zip(headers, headers[1:] + [len(lines)]):
         match = DIFF_HEADER.fullmatch(lines[start])
         if not match:
@@ -104,6 +110,16 @@ def select(patch: bytes, tests: list[dict], dependencies: dict) -> list[dict]:
         old, new = (path.decode("utf-8", errors="replace") for path in match.groups())
         if old not in by_path or new not in by_path:
             return tests
+        if old == new and coverage and old in coverage["files"]:
+            groups = generator_groups(lines[start + 1:end], coverage["files"][old])
+            if groups is not None:
+                if catalog_ids is None:
+                    catalog_ids = {test["id"] for test in tests}
+                consumers = [catalog_ids.intersection(coverage["groups"][group]) for group in groups]
+                if all(consumers):
+                    covered_tests.update(*consumers)
+                    unmeasured_files.update(by_path[old])
+                    continue
         spans = [*by_symbol.get(old, ()), *by_method.get(old, ())]
         if old == new and spans:
             consumers = symbol_consumers(lines[start + 1:end], spans)
@@ -113,15 +129,25 @@ def select(patch: bytes, tests: list[dict], dependencies: dict) -> list[dict]:
         affected.update(by_path[old])
         affected.update(by_path[new])
 
-    selected = [test for test in tests if test["file"] in affected]
+    measured = coverage["measured"] if coverage else ()
+    selected = [
+        test for test in tests
+        if test["file"] in affected
+        or (covered_tests and test["id"] in covered_tests)
+        or (test["file"] in unmeasured_files and test["id"] not in measured)
+    ]
     return selected or tests
 
 
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     dependencies = json.loads(DEPENDENCIES.read_text())
+    coverage = json.loads(GENERATOR_COVERAGE.read_text())
+    if coverage["revision"] != dependencies["revision"]:
+        raise ValueError("Static index and generator coverage use different revisions")
+    coverage["measured"] = set(coverage["measured"])
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        selected = select(patch.read_bytes(), tests, dependencies)
+        selected = select(patch.read_bytes(), tests, dependencies, coverage)
         workers = schedule(selected)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
 
