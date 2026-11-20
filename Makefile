@@ -27,3 +27,7 @@ sample: build
 check: build
 	docker run $(RUN_FLAGS) $(IMAGE) > $(OUTPUT)
 	python3 score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT) > /dev/null && echo "format ok"
+
+.PHONY: sample-full
+sample-full: build
+	python3 full_score.py "$(IMAGE)" -- $(RUN_FLAGS)

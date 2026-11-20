@@ -38,6 +38,15 @@ make check    # the output's format only
 
 `sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
 
+## Compare full scores locally
+
+Run `make sample-full` for three fresh containers with the same limits as `make sample`.
+The runner uses the official scorer and reports simulated seconds, misses, CPU time and total per run, followed by the median total rounded to one decimal place.
+It reads the container's cgroup v2 CPU counter around the selector, including its child processes.
+The local timing requires the starter image's `/usr/local/bin/python`, adds a small measurement overhead and varies by machine.
+Compare on the same machine without overlapping runs.
+Use `make sample-full IMAGE=blast-radius-claude` in Claude's worktree and `make sample-full IMAGE=blast-radius-codex` in Codex's worktree.
+
 ## Submit
 
 Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.
