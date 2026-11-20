@@ -49,7 +49,9 @@ Use `make sample-full IMAGE=blast-radius-claude` in Claude's worktree and `make 
 
 ## Static selector
 
-The selector maps changed paths to test files, selects every test in those files, and keeps the starter's three-worker scheduling.
+The selector maps changed paths to test files and selects every test in those files.
+For each commit, it tries up to eight workers by assigning the longest tests first to the least loaded worker.
+It picks the schedule with the lowest busiest-worker time plus two seconds per worker, using fewer workers on ties.
 The index follows Python imports transitively, includes package initializers, and adds static links for lazy dialect references and SQL fixtures.
 An unknown or unsupported patch path falls back to the full test suite.
 The index is built from a clean checkout of the pinned sqlglot revision and does not use sample patches, test IDs or failure labels.
