@@ -956,6 +956,49 @@ def is_doc(path):
         path.endswith(DOC_SUFFIXES) and not path.startswith(("tests/", "sqlglot/")))
 
 
+def executor_fixture_readers(path, before, after, readers, index):
+    """Narrow TestExecutor's shared setUpClass reads on a single fixture edit."""
+    suites = {
+        "tests/fixtures/optimizer/tpc-h/tpc-h.sql": "tpch",
+        "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "tpcds",
+    }
+    suite = suites.get(path)
+    if not suite or index.unknown:
+        return readers
+
+    def fields(text):
+        # Match the pinned load_sql_fixture_pairs filter and semicolon pairing.
+        statements = "\n".join(line for line in text.splitlines()
+                               if line and not line.startswith("--")).split(";")
+        inputs = [part.strip() for part in statements[:-1:2]]
+        expected = [part.strip() for part in statements[1::2]]
+        return inputs, expected
+
+    inputs, expected = fields(before)
+    new_inputs, new_expected = fields(after)
+    # A malformed metadata header can raise while setUpClass loads either suite.
+    # Only trust edits with the same headers on every paired input.
+    def headers(sql):
+        lines = sql.split("\n")
+        for i, line in enumerate(lines):
+            if not line.startswith("#"):
+                return lines[:i]
+        return None
+
+    if len(inputs) != len(new_inputs) or any(
+        headers(a) != headers(b) or headers(b) is None for a, b in zip(inputs, new_inputs)
+    ):
+        return readers
+    affected = set()
+    if inputs != new_inputs:
+        affected.add("test_execute_" + suite)
+    if suite == "tpch" and (inputs != new_inputs or expected != new_expected):
+        affected.add("test_optimized_tpch")
+    prefix = "tests/test_executor.py::TestExecutor::"
+    return {t for t in readers if not index.test_ids[t].startswith(prefix)
+            or index.test_ids[t][len(prefix):] in affected}
+
+
 def select_patch(patch_text, index, all_tests):
     """Select with the original conservative rules, then, if some impact was
     widened only because it also runs at import time and importing the patch
@@ -1037,13 +1080,17 @@ def select(patch_text, index, all_tests, trust_import_state=False):
         new_text, changed, inserts, n2b = applied
         if not path.endswith(".py"):
             hit = False
+            readers = set()
             if path in index.opens:
-                chosen |= set(index.tests_of(index.opens[path]))
+                readers.update(index.tests_of(index.opens[path]))
                 hit = True
             for test_path in index.collect_opens.get(path, []):
-                chosen |= index.tests_in.get(test_path, set())
+                readers.update(index.tests_in.get(test_path, set()))
                 hit = True
             if hit:
+                if len(files) == 1:
+                    readers = executor_fixture_readers(path, base_text, new_text, readers, index)
+                chosen.update(readers)
                 reasons.append("fixture")
                 continue
             if path.startswith("tests/fixtures/"):
@@ -1237,19 +1284,23 @@ def schedule(selected, dur):
         return []
     items = sorted(((dur[t], t) for t in selected), reverse=True)
     total = sum(ms for ms, _ in items)
-    best = None
+    bounds = []
     for k in range(1, min(MAX_WORKERS, len(items)) + 1):
         lower = max(items[0][0], -(-total // k))
-        if best is not None and lower + WORKER_MS * k >= best[0]:
-            continue
+        bounds.append((lower + WORKER_MS * k, k, lower))
+    best_key = None
+    for bound, k, lower in sorted(bounds):
+        if best_key is not None and (bound, k) >= best_key:
+            break
         span_, workers, loads = lpt(items, k)
         if span_ > lower and len(items) <= 400:
             workers, loads = improve(workers, loads, dur)
             span_ = max(loads)
-        cost = span_ + WORKER_MS * k
-        if best is None or cost < best[0]:
-            best = (cost, [w for w in workers if w])
-    return best[1]
+        key = (span_ + WORKER_MS * k, k)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = [w for w in workers if w]
+    return best
 
 
 def fill_idle(workers, extra, dur):
@@ -1273,6 +1324,7 @@ def main():
     all_tests = [t["number"] for t in tests]
     remaining = set(all_tests)
     index = Index(INDEX, tests)
+    index.test_ids = {t["number"]: t["id"] for t in tests}
     index.tests = tests
     index.test_file = {t["number"]: t["file"] for t in tests}
     index.tests_in = {}
