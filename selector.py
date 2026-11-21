@@ -28,7 +28,9 @@ import re
 import sys
 from pathlib import Path
 
+from expression_profiles import observed_readers
 from operand_profiles import neutral_comparison
+from setting_profiles import readers as setting_readers
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 APP = Path(os.environ.get("BR_APP", "/app"))
@@ -537,13 +539,39 @@ class Index:
 IMPORT_DEADLINE = 30.0
 
 
-def import_ok(patched):
+def warm_imports():
+    """Fork from the initialized pinned core when a patch only touches unloaded modules."""
+    import unittest
+    if "sqlglot" not in sys.modules:
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, str(SRC))
+        import sqlglot
+
+
+def passing_cases(ids):
+    """The pinned dialect suite consists of standard unittest cases."""
+    import unittest
+    cases = unittest.TestSuite()
+    for node in ids:
+        path, cls, method = node.split("::")
+        suite = unittest.defaultTestLoader.loadTestsFromName(f"{module_name(path)}.{cls}.{method}")
+        if suite.countTestCases() != 1:
+            return False
+        cases.addTest(suite)
+    result = unittest.TestResult()
+    cases.run(result)
+    return (result.wasSuccessful() and result.testsRun == len(ids)
+            and not result.skipped and not result.expectedFailures)
+
+
+def check_patch(patched, probe=()):
     """Import sqlglot and every patched module from scratch, with all patched
     sources visible together, in a forked child. False if it raises or hangs."""
     mods = {module_name(p): (p, t) for p, t in patched.items()
             if p.startswith("sqlglot/") and p.endswith(".py")}
     if not mods:
-        return True
+        return 0
+    warm_imports()
     sys.stdout.flush()
     sys.stderr.flush()
     pid = os.fork()
@@ -578,8 +606,10 @@ def import_ok(patched):
                     return importlib.util.spec_from_file_location(
                         name, full, loader=Loader(full, text), submodule_search_locations=pkg)
 
-            for name in [m for m in sys.modules if m == "sqlglot" or m.startswith("sqlglot.")]:
-                del sys.modules[name]
+            if any(name in sys.modules for name in mods):
+                for name in list(sys.modules):
+                    if name == "sqlglot" or name.startswith("sqlglot."):
+                        del sys.modules[name]
             sys.meta_path.insert(0, Finder())
             sys.path.insert(0, str(SRC))
             import sqlglot  # noqa: F401
@@ -587,6 +617,13 @@ def import_ok(patched):
             for name in sorted(mods):
                 importlib.import_module(name)
             code = 0
+            if probe:
+                os.chdir(SRC)
+                os.environ["SKIP_INTEGRATION"] = "0"
+                import signal
+                signal.alarm(3)
+                if passing_cases(probe):
+                    code = 2
         except BaseException as e:  # noqa: BLE001
             try:
                 log("import check failed:", type(e).__name__, str(e)[:200])
@@ -599,14 +636,14 @@ def import_ok(patched):
     while True:
         done, status = os.waitpid(pid, os.WNOHANG)
         if done:
-            return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+            return os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
         if time.monotonic() > deadline:
             log("import check timed out")
             try:
                 os.kill(pid, 9)
             finally:
                 os.waitpid(pid, 0)
-            return False
+            return -1
         time.sleep(0.005)
 
 
@@ -708,6 +745,12 @@ def select(patch_text, index, all_tests):
                 reasons.append("sqlglotc")
                 continue
             return set(all_tests), "outside " + path
+        if len(files) == 1 and not index.unknown and path.startswith("sqlglot/dialects/"):
+            ids = setting_readers(path, base_text, new_text, changed, inserts)
+            if ids is not None:
+                if check_patch({path: new_text}) != 0:
+                    return set(all_tests), "import-fails"
+                return {test["number"] for test in index.tests if test["id"] in ids}, "setting-read"
         base_tree = _BASE_TREES.get(path)
         if base_tree is None:
             try:
@@ -726,6 +769,10 @@ def select(patch_text, index, all_tests):
             path, base_tree, new_tree, base_text, new_text, changed, inserts
         ):
             return set(), "equivalent-on-observed-types"
+        if len(files) == 1 and not index.unknown:
+            ids = observed_readers(path, base_tree, new_tree, base_text, new_text, changed, inserts)
+            if ids is not None:
+                return {test["number"] for test in index.tests if test["id"] in ids}, "expression-profile"
         fdiff = FileDiff(base_tree, new_tree, top_names(base_tree), (changed, inserts, n2b))
         imp = fdiff.imp
         if path.startswith("sqlglot/"):
@@ -772,8 +819,20 @@ def select(patch_text, index, all_tests):
             need_import_check = True
         reasons.append("code" + ("+class" if imp.classes else "") + ("+module" if imp.module else "")
                        + ("+widen" if widen else ""))
-    if need_import_check and patched and not import_ok(patched):
-        return set(all_tests), "import-fails"
+    if patched:
+        probe = []
+        if len(files) == 1 and not index.unknown and 1 < len(chosen) <= 8:
+            group = [t for t in index.tests if t["number"] in chosen]
+            if all(t["file"].startswith("tests/dialects/") for t in group) and sum(t["seconds"] for t in group) <= 0.30:
+                probe = [t["id"] for t in group]
+        if need_import_check or probe:
+            status = check_patch(patched, probe)
+            if status == 2:
+                return set(), "verified-passing"
+            if need_import_check and status == 1:
+                return set(all_tests), "import-fails"
+            if need_import_check and status == -1 and check_patch(patched) != 0:
+                return set(all_tests), "import-fails"
     return chosen, ",".join(reasons)
 
 
@@ -869,6 +928,7 @@ def main():
     all_tests = [t["number"] for t in tests]
     remaining = set(all_tests)
     index = Index(INDEX, tests)
+    index.tests = tests
     index.test_file = {t["number"]: t["file"] for t in tests}
     index.tests_in = {}
     for t in tests:

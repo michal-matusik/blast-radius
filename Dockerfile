@@ -2,6 +2,9 @@
 # digest is the image we labeled every commit in.
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 
+COPY requirements.lock /req.lock
+RUN pip install --no-cache-dir -r /req.lock
+
 # Base sources of sqlglot at the pinned commit: the selector applies each patch
 # to them and diffs the ASTs; the import check imports the patched modules.
 ARG SQLGLOT_SHA=eb11aec4be8cb2122afe713a4816662c3f0fb2fa
@@ -17,7 +20,7 @@ RUN mkdir -p /app/src \
 COPY data/index.json.gz /app/index.json.gz
 COPY tools/to_marshal.py /app/to_marshal.py
 RUN python /app/to_marshal.py /app/index.json.gz /app/index.marshal && chmod a+r /app/index.*
-COPY data/operands.json.gz /app/data/operands.json.gz
-COPY selector.py operand_profiles.py /app/
+COPY data/operands.json.gz data/settings.json.gz data/expressions.json.gz /app/data/
+COPY selector.py operand_profiles.py setting_profiles.py expression_profiles.py /app/
 RUN chmod a+r /app/selector.py
 CMD ["python", "/app/selector.py"]
