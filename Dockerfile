@@ -17,6 +17,7 @@ RUN mkdir -p /app/src \
 COPY data/index.json.gz /app/index.json.gz
 COPY tools/to_marshal.py /app/to_marshal.py
 RUN python /app/to_marshal.py /app/index.json.gz /app/index.marshal && chmod a+r /app/index.*
-COPY selector.py /app/selector.py
+COPY data/operands.json.gz /app/data/operands.json.gz
+COPY selector.py operand_profiles.py /app/
 RUN chmod a+r /app/selector.py
 CMD ["python", "/app/selector.py"]

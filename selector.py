@@ -28,6 +28,8 @@ import re
 import sys
 from pathlib import Path
 
+from operand_profiles import neutral_comparison
+
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 APP = Path(os.environ.get("BR_APP", "/app"))
 SRC = APP / "src"
@@ -155,14 +157,14 @@ BODY_FIELDS = ("body", "orelse", "finalbody")
 DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef)
 
 
-def strip_docstrings(tree):
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-            body = node.body
-            if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
-                    and isinstance(body[0].value.value, str)):
-                node.body = body[1:]
-    return tree
+def executable_body(node):
+    """Skip a definition's docstring when its statement block is compared."""
+    body = node.body
+    if body and isinstance(body[0], ast.Expr):
+        value = body[0].value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            return body[1:]
+    return body
 
 
 def dump(node):
@@ -238,7 +240,7 @@ class FileDiff:
         self.imp = Impacts()
         self.base_names = base_names
         self.edits = edits
-        self.diff_block(base_tree.body, new_tree.body, ("module",), None)
+        self.diff_block(executable_body(base_tree), executable_body(new_tree), ("module",), None)
 
     # Statements whose source text the patch left alone get a cheap key instead
     # of a full AST dump: same text gives the same AST.
@@ -304,12 +306,13 @@ class FileDiff:
             if ctx[0] == "func":
                 if header_dump(b) != header_dump(n):
                     self.imp.lines.append(span(b))
-                self.diff_block(b.body, n.body, ("func", None), body_span(b.body))
+                body = executable_body(b)
+                self.diff_block(body, executable_body(n), ("func", None), body_span(body))
                 return
             if header_dump(b) != header_dump(n):
                 self.class_level(("class", q))
                 self.imp.lines.append(span(b))
-            self.diff_block(b.body, n.body, ("class", q), None)
+            self.diff_block(executable_body(b), executable_body(n), ("class", q), None)
             return
         if isinstance(b, DEF_TYPES) and b.name == n.name:
             if header_dump(b) != header_dump(n):
@@ -319,7 +322,8 @@ class FileDiff:
                     self.class_level(ctx)
                 else:
                     self.imp.lines.append(span(b))
-            self.diff_block(b.body, n.body, ("func", None), body_span(b.body))
+            body = executable_body(b)
+            self.diff_block(body, executable_body(n), ("func", None), body_span(body))
             return
         if any(hasattr(b, f) for f in BODY_FIELDS) and not isinstance(b, (ast.ClassDef,) + DEF_TYPES):
             if header_dump(b) != header_dump(n):
@@ -707,17 +711,21 @@ def select(patch_text, index, all_tests):
         base_tree = _BASE_TREES.get(path)
         if base_tree is None:
             try:
-                base_tree = _BASE_TREES[path] = strip_docstrings(ast.parse(base_text))
+                base_tree = _BASE_TREES[path] = ast.parse(base_text)
             except SyntaxError:
                 return set(all_tests), "base-unparsable"
         try:
-            new_tree = strip_docstrings(ast.parse(new_text))
+            new_tree = ast.parse(new_text)
         except SyntaxError:
             if path.startswith("tests/"):
                 chosen |= index.tests_in.get(path, set()) | index.module_tests(path)
                 reasons.append("test-syntax")
                 continue
             return set(all_tests), "syntax-error"
+        if len(files) == 1 and not index.unknown and neutral_comparison(
+            path, base_tree, new_tree, base_text, new_text, changed, inserts
+        ):
+            return set(), "equivalent-on-observed-types"
         fdiff = FileDiff(base_tree, new_tree, top_names(base_tree), (changed, inserts, n2b))
         imp = fdiff.imp
         if path.startswith("sqlglot/"):

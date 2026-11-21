@@ -52,6 +52,9 @@ Use `make sample-full IMAGE=blast-radius-claude` in Claude's worktree and `make 
 The image applies each patch independently to the pinned sources and compares Python statements using their ASTs.
 The selector looks up affected statements, classes, imports and fixture reads in the pinned test suite's coverage index.
 Changed definitions are compared recursively so a one-line change in a large class does not require serializing the whole class.
+For an isolated change between identity and equality, the selector also checks the operand types observed at that expression across the pinned suite.
+It skips the comparison only when the operators agree for every pair in the recorded domains and the patch preserves the operands.
+A custom equality method, missing observations, or a new test ID causes it to use ordinary impact selection.
 See [the tracing tools](tools/README.md) for the index generation procedure.
 
 The scheduler tries up to eight worker counts and minimizes the official simulated cost.
