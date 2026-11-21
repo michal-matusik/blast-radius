@@ -18,6 +18,7 @@ OUT = os.environ["BR_OUT"]
 PREFIXES = (os.path.join(ROOT, "sqlglot") + os.sep, os.path.join(ROOT, "tests") + os.sep)
 TOOL = 3
 MON = sys.monitoring
+DISABLE = MON.DISABLE  # module globals may be cleared at interpreter shutdown
 
 _lines = set()
 _types = set()
@@ -29,16 +30,23 @@ _records = {}
 def _line(code, line):
     if _active and code.co_filename.startswith(PREFIXES):
         _lines.add((code.co_filename, line))
-    return MON.DISABLE
+    return DISABLE
+
+
+_collecting = None  # test file being collected
+_collect_opens = {}
 
 
 def _audit(event, args):
-    if _active and event == "open" and args and isinstance(args[0], str):
+    if (_active or _collecting) and event == "open" and args and isinstance(args[0], str):
         path = args[0]
         if not path.endswith((".pyc", ".py")) or "/fixtures/" in path:
             real = os.path.realpath(path) if not path.startswith(ROOT) else path
             if real.startswith(ROOT):
-                _opens.add(real)
+                if _active:
+                    _opens.add(real)
+                else:
+                    _collect_opens.setdefault(_collecting, set()).add(real)
 
 
 def _wrap_inits():
@@ -182,6 +190,19 @@ import pytest  # noqa: E402
 
 
 @pytest.hookimpl(hookwrapper=True)
+def pytest_make_collect_report(collector):
+    """Files read while a test module is imported affect all of its tests."""
+    global _collecting
+    path = getattr(collector, "path", None)
+    mod = isinstance(collector, pytest.Module) and path is not None
+    if mod:
+        _collecting = os.path.relpath(str(path), ROOT)
+    yield
+    if mod:
+        _collecting = None
+
+
+@pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_setup(item):
     global _active
     MON.restart_events()
@@ -236,4 +257,6 @@ def pytest_sessionfinish(session):
         }
     with open(os.path.join(OUT, f"trace-{wid}.json"), "w") as f:
         imp = sorted((fid(f), l) for f, l in _import_lines)
-        json.dump({"files": sorted(files, key=files.get), "tests": out, "import": imp}, f)
+        collect = {k: sorted(_rel(p) for p in v) for k, v in _collect_opens.items()}
+        json.dump({"files": sorted(files, key=files.get), "tests": out, "import": imp,
+                   "collect_opens": collect}, f)

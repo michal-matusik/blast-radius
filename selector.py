@@ -197,8 +197,14 @@ def masked_dump(node):
     return ast.dump(Mask().visit(copy.deepcopy(node)))
 
 
+def first_line(node):
+    """First source line of a statement, counting decorators."""
+    decs = getattr(node, "decorator_list", None)
+    return min([node.lineno] + [d.lineno for d in decs]) if decs else node.lineno
+
+
 def span(node):
-    return (node.lineno, node.end_lineno or node.lineno)
+    return (first_line(node), node.end_lineno or node.lineno)
 
 
 def body_span(stmts):
@@ -239,7 +245,7 @@ class FileDiff:
     def key_base(self, s):
         if self.edits is not None:
             changed, inserts, _ = self.edits
-            lo, hi = s.lineno, s.end_lineno or s.lineno
+            lo, hi = first_line(s), s.end_lineno or s.lineno
             if not any(lo <= c <= hi for c in changed) and not any(lo <= p < hi for p in inserts):
                 return ("U", lo, hi)
         return dump(s)
@@ -247,7 +253,7 @@ class FileDiff:
     def key_new(self, s):
         if self.edits is not None:
             n2b = self.edits[2]
-            lo, hi = s.lineno, s.end_lineno or s.lineno
+            lo, hi = first_line(s), s.end_lineno or s.lineno
             bl, bh = n2b.get(lo), n2b.get(hi)
             if bl is not None and bh is not None and bh - bl == hi - lo and all(
                     n2b.get(x) == bl + x - lo for x in range(lo, hi + 1)):
@@ -353,6 +359,9 @@ class FileDiff:
             for x, y in zip(bl, nl):
                 if dump(x) != dump(y):
                     self.imp.lam_lines.append(span(x))
+                    if dump(x.args) != dump(y.args):
+                        # defaults are evaluated when the lambda is created
+                        self.imp.import_check = True
             return
         self.imp.lines.append(rng)
         self.class_level(ctx)
@@ -372,8 +381,12 @@ class FileDiff:
             if block:
                 self.imp.lines.append(body_span(block))
             return
+        # A brand-new plain function nobody can reference yet only needs to import.
+        # Decorators, base classes and metaclasses can register things, so any
+        # other inserted definition counts as a module-level change.
         if ctx[0] == "module" and all(
-            isinstance(s, DEF_TYPES + (ast.ClassDef,)) and s.name not in self.base_names for s in stmts
+            isinstance(s, DEF_TYPES) and not s.decorator_list and s.name not in self.base_names
+            for s in stmts
         ):
             self.imp.import_check = True
             return
@@ -438,21 +451,28 @@ class Index:
         self.importers = d["importers"]
         self.mod_classes = d["mod_classes"]
         ids = d.get("ids")
+        self._cache = {}
+        self.class_refs = d.get("class_refs", {})
+        self.collect_opens = d.get("collect_opens", {})
         self.n = len(tests)
         # remap index test numbers onto this run's tests.json by test id
         if ids is not None:
             by_id = {t["id"]: t["number"] for t in tests}
             self.remap = [by_id.get(i) for i in ids]
-            self.unknown = [t["number"] for t in tests if t["id"] not in set(ids)]
+            known = set(ids)
+            self.unknown = [t["number"] for t in tests if t["id"] not in known]
         else:
             self.remap = None
             self.unknown = []
 
     def tests_of(self, sid):
-        s = self.sets[sid]
-        if self.remap is None:
-            return s
-        return [self.remap[x] for x in s if self.remap[x] is not None]
+        cached = self._cache.get(sid)
+        if cached is None:
+            s = self.sets[sid]
+            if self.remap is not None:
+                s = [self.remap[x] for x in s if self.remap[x] is not None]
+            cached = self._cache[sid] = frozenset(s)
+        return cached
 
     def line_tests(self, f, lo, hi):
         out = set()
@@ -473,74 +493,121 @@ class Index:
         sid = self.classes.get(key)
         return set(self.tests_of(sid)) if sid is not None else set()
 
+    def ref_tests(self, qualname):
+        """Tests that ran a line naming the class (static access, no instance needed)."""
+        sid = self.class_refs.get(qualname.rsplit(".", 1)[-1])
+        return set(self.tests_of(sid)) if sid is not None else set()
+
+    def importers_of(self, f):
+        """Modules importing f, directly or through other importers."""
+        seen, todo = set(), [f]
+        while todo:
+            for imp in self.importers.get(todo.pop(), []):
+                if imp not in seen and imp != f:
+                    seen.add(imp)
+                    todo.append(imp)
+        return seen
+
     def module_tests(self, f):
+        cached = self._cache.get(("module", f))
+        if cached is not None:
+            return set(cached)
         out = self.file_tests(f)
         for c in self.mod_classes.get(f, []):
             out |= self.class_tests(c)
-        for imp in self.importers.get(f, []):
-            out |= self.file_tests(imp) if imp.startswith("tests/") else set()
+        for imp in self.importers_of(f):
+            if imp.startswith("tests/"):
+                out |= self.file_tests(imp)
+                out |= self.tests_in.get(imp, set())
             for c in self.mod_classes.get(imp, []):
                 out |= self.class_tests(c)
+        self._cache[("module", f)] = frozenset(out)
         return out
 
 
 # --------------------------------------------------------------------------- import check
 
 
-_preloaded = False
+IMPORT_DEADLINE = 30.0
 
 
 def import_ok(patched):
-    """Run the patched sqlglot modules' code in a forked child of a process that
-    already imported base sqlglot. False if the module code raises."""
-    global _preloaded
-    mods = [(module_name(p), p, t) for p, t in sorted(patched.items())
-            if p.startswith("sqlglot/") and p.endswith(".py")]
+    """Import sqlglot and every patched module from scratch, with all patched
+    sources visible together, in a forked child. False if it raises or hangs."""
+    mods = {module_name(p): (p, t) for p, t in patched.items()
+            if p.startswith("sqlglot/") and p.endswith(".py")}
     if not mods:
         return True
-    if not _preloaded:
-        sys.path.insert(0, str(SRC))
-        sys.dont_write_bytecode = True
-        try:
-            import sqlglot  # noqa: F401
-        except Exception as e:  # noqa: BLE001
-            log("base sqlglot import failed:", e)
-            return False
-        _preloaded = True
     sys.stdout.flush()
     sys.stderr.flush()
     pid = os.fork()
     if pid == 0:
-        code = 0
+        code = 1
         try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 1)  # the child must never write answers
             import importlib
-            import types
+            import importlib.abc
+            import importlib.util
 
-            for name, path, text in mods:
-                parent = name.rpartition(".")[0]
-                if parent:
-                    importlib.import_module(parent)
-                mod = types.ModuleType(name)
-                mod.__file__ = str(SRC / path)
-                if path.endswith("__init__.py"):
-                    mod.__path__ = [str(SRC / os.path.dirname(path))]
-                    mod.__package__ = name
-                else:
-                    mod.__package__ = parent
-                sys.modules[name] = mod
-                exec(compile(text, mod.__file__, "exec"), mod.__dict__)
+            sys.dont_write_bytecode = True
+
+            class Loader(importlib.abc.SourceLoader):
+                def __init__(self, path, text):
+                    self.path, self.text = path, text
+
+                def get_filename(self, fullname):
+                    return self.path
+
+                def get_data(self, path):
+                    return self.text.encode("utf-8")
+
+            class Finder(importlib.abc.MetaPathFinder):
+                def find_spec(self, name, path=None, target=None):
+                    if name not in mods:
+                        return None
+                    rel, text = mods[name]
+                    full = str(SRC / rel)
+                    pkg = [str(SRC / os.path.dirname(rel))] if rel.endswith("__init__.py") else None
+                    return importlib.util.spec_from_file_location(
+                        name, full, loader=Loader(full, text), submodule_search_locations=pkg)
+
+            for name in [m for m in sys.modules if m == "sqlglot" or m.startswith("sqlglot.")]:
+                del sys.modules[name]
+            sys.meta_path.insert(0, Finder())
+            sys.path.insert(0, str(SRC))
+            import sqlglot  # noqa: F401
+
+            for name in sorted(mods):
+                importlib.import_module(name)
+            code = 0
         except BaseException as e:  # noqa: BLE001
             try:
                 log("import check failed:", type(e).__name__, str(e)[:200])
             except Exception:  # noqa: BLE001
                 pass
-            code = 1
         os._exit(code)
-    _, status = os.waitpid(pid, 0)
-    return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    import time
+
+    deadline = time.monotonic() + IMPORT_DEADLINE
+    while True:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+        if time.monotonic() > deadline:
+            log("import check timed out")
+            try:
+                os.kill(pid, 9)
+            finally:
+                os.waitpid(pid, 0)
+            return False
+        time.sleep(0.005)
 
 
 # --------------------------------------------------------------------------- selection
+
+
+_BASE_TREES = {}
 
 
 def is_doc(path):
@@ -575,6 +642,8 @@ def select(patch_text, index, all_tests):
         if is_doc(path):
             reasons.append("doc")
             continue
+        if os.path.basename(path) == "conftest.py":
+            return set(all_tests), "conftest"
         base_path = SRC / path
         if old is None:  # new file
             if path.endswith(".py") and path.startswith(("sqlglot/", "tests/")):
@@ -609,8 +678,14 @@ def select(patch_text, index, all_tests):
             return set(all_tests), "apply-failed"
         new_text, changed, inserts, n2b = applied
         if not path.endswith(".py"):
+            hit = False
             if path in index.opens:
                 chosen |= set(index.tests_of(index.opens[path]))
+                hit = True
+            for test_path in index.collect_opens.get(path, []):
+                chosen |= index.tests_in.get(test_path, set())
+                hit = True
+            if hit:
                 reasons.append("fixture")
                 continue
             if path.startswith("tests/fixtures/"):
@@ -625,17 +700,17 @@ def select(patch_text, index, all_tests):
                 reasons.append("sqlglotc")
                 continue
             return set(all_tests), "outside " + path
-        if os.path.basename(path) == "conftest.py":
-            return set(all_tests), "conftest"
-        try:
-            base_tree = strip_docstrings(ast.parse(base_text))
-        except SyntaxError:
-            return set(all_tests), "base-unparsable"
+        base_tree = _BASE_TREES.get(path)
+        if base_tree is None:
+            try:
+                base_tree = _BASE_TREES[path] = strip_docstrings(ast.parse(base_text))
+            except SyntaxError:
+                return set(all_tests), "base-unparsable"
         try:
             new_tree = strip_docstrings(ast.parse(new_text))
         except SyntaxError:
             if path.startswith("tests/"):
-                chosen |= {t for t in all_tests if index.test_file[t] == path} | index.module_tests(path)
+                chosen |= index.tests_in.get(path, set()) | index.module_tests(path)
                 reasons.append("test-syntax")
                 continue
             return set(all_tests), "syntax-error"
@@ -670,10 +745,17 @@ def select(patch_text, index, all_tests):
                 chosen |= index.class_tests(mod + ":" + q)
                 if q in spans:
                     chosen |= index.line_tests(path, *spans[q])
+        if imp.classes:
+            for q in imp.classes:
+                chosen |= index.ref_tests(q)
+        if path.startswith("tests/") and (imp.classes or imp.module or imp.import_check):
+            # a test module or class body that changes can break collection of the
+            # whole file and of every test file that imports it
+            imp.module = True
         if imp.module or widen:
             chosen |= index.module_tests(path)
             if path.startswith("tests/"):
-                chosen |= {t for t in all_tests if index.test_file[t] == path}
+                chosen |= index.tests_in.get(path, set())
         if imp.import_check:
             need_import_check = True
         reasons.append("code" + ("+class" if imp.classes else "") + ("+module" if imp.module else "")
@@ -775,6 +857,9 @@ def main():
     all_tests = [t["number"] for t in tests]
     index = Index(INDEX, tests)
     index.test_file = {t["number"]: t["file"] for t in tests}
+    index.tests_in = {}
+    for t in tests:
+        index.tests_in.setdefault(t["file"], set()).add(t["number"])
     total_cost = 0
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:

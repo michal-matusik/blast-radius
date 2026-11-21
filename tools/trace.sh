@@ -10,7 +10,8 @@ cp "$HERE/../requirements.lock" "$WORK/req.lock"
 printf 'FROM python:3.13-slim\nCOPY req.lock /req.lock\nRUN pip install --no-cache-dir -r /req.lock\n' > "$WORK/Dockerfile"
 docker build -q -t br-trace-arm "$WORK"
 run() {
-  docker run --rm -v "$SRC:/src" -v "$HERE:/tools:ro" -v "$WORK/$1:/out" -w /src \
+  out=$1; shift
+  docker run --rm -v "$SRC:/src" -v "$HERE:/tools:ro" -v "$WORK/$out:/out" -w /src \
     -e SKIP_INTEGRATION=0 -e PYTHONPATH=/src:/tools -e BR_OUT=/out -e BR_ROOT=/src \
     -e PYTHONDONTWRITEBYTECODE=1 br-trace-arm \
     python -m pytest tests -q -p no:cacheprovider -p br_trace "$@" | tail -1

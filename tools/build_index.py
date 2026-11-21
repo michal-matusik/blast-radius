@@ -8,6 +8,7 @@ whose attribution changes with test order (lazily cached code).
 """
 import ast
 import collections
+import glob
 import gzip
 import json
 import os
@@ -79,6 +80,15 @@ def main():
             for o in rec["opens"]:
                 opens[o].add(n)
 
+    lines_by_file = collections.defaultdict(dict)
+    for (f, l), s_ in lines.items():
+        lines_by_file[f][l] = s_
+    collect_opens = collections.defaultdict(set)
+    for d in sys.argv[4:]:
+        for path in glob.glob(os.path.join(d, "trace-*.json")):
+            for test_file, opened in json.load(open(path)).get("collect_opens", {}).items():
+                for o in opened:
+                    collect_opens[o].add(test_file)
     sets = {}
 
     def sid(s):
@@ -100,11 +110,28 @@ def main():
         for n in names:
             if n.endswith(".py"):
                 py_files.append(os.path.relpath(os.path.join(root, n), src))
+    # class name -> tests that ran a line naming it (static access needs no instance)
+    class_names = set()
+    trees = {}
+    for p in py_files:
+        trees[p] = ast.parse(open(os.path.join(src, p), encoding="utf-8").read())
+        for node in ast.walk(trees[p]):
+            if isinstance(node, ast.ClassDef):
+                class_names.add(node.name)
+    refs = collections.defaultdict(set)
+    for p, tree in trees.items():
+        flines = lines_by_file.get(p, {})
+        for node in ast.walk(tree):
+            name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
+            if name in class_names:
+                s = flines.get(node.lineno)
+                if s:
+                    refs[name] |= s
     mod_of = {module_name(p): p for p in py_files}
     importers = collections.defaultdict(set)
     mod_classes = {}
     for p in py_files:
-        tree = ast.parse(open(os.path.join(src, p), encoding="utf-8").read())
+        tree = trees[p]
         mod_classes[p] = classes_in(tree, module_name(p))
         for m in imports_of(tree, p):
             if m in mod_of and mod_of[m] != p:
@@ -122,6 +149,8 @@ def main():
         "opens": {o: sid(s) for o, s in opens.items()},
         "importers": {k: sorted(v) for k, v in importers.items()},
         "mod_classes": mod_classes,
+        "class_refs": {k: sid(v) for k, v in refs.items()},
+        "collect_opens": {k: sorted(v) for k, v in collect_opens.items()},
     }
     # sid() above may have added sets after the list was built
     index["sets"] = [list(k) for k in sorted(sets, key=sets.get)]
