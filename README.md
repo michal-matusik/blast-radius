@@ -47,50 +47,15 @@ The local timing requires the starter image's `/usr/local/bin/python`, adds a sm
 Compare on the same machine without overlapping runs.
 Use `make sample-full IMAGE=blast-radius-claude` in Claude's worktree and `make sample-full IMAGE=blast-radius-codex` in Codex's worktree.
 
-## Static selector
+## Coverage-based selection
 
-The selector maps changed paths to test files and selects every test in those files.
-For each commit, it tries up to eight workers by assigning the longest tests first to the least loaded worker.
-It prices each candidate using busiest-worker time plus two seconds per worker.
-A bounded balancing pass moves or swaps tests between the heaviest and lightest workers.
-The index follows Python imports transitively, includes package initializers, and adds static links for lazy dialect references and SQL fixtures.
-For edits wholly inside indexed top-level function bodies, the selector can use a narrower set of test files.
-The function index follows sibling references and statically resolved named imports or module attributes.
-It retains file-level selection for dynamic or unresolved uses, unsupported edits, and functions without a distinct set of known consumers.
-For dialect parser and generator methods, the index follows the owning class and retains references through base classes, sibling classes, and exported functions.
-When static analysis cannot distinguish which tests reach the owner, or an edit can change class structure, the selector retains file-level selection.
-The generator selector also uses per-test call traces from the pinned, unpatched dialect test suite.
-It handles edits inside generator method bodies and top-level dispatch helpers, validates the hunk against the original source, and checks that the result compiles.
-The embedded source is covered by [SQLGLOT-LICENSE](SQLGLOT-LICENSE).
-It keeps observed consumers and retains static selection for test IDs without usable coverage.
-Import-time code, unobserved symbols and structural edits retain the static fallback.
-Coverage reflects the baseline run and can miss calls that only occur under a different test environment.
+The image applies each patch independently to the pinned sources and compares Python statements using their ASTs.
+The selector looks up affected statements, classes, imports and fixture reads in the pinned test suite's coverage index.
+Changed definitions are compared recursively so a one-line change in a large class does not require serializing the whole class.
+See [the tracing tools](tools/README.md) for the index generation procedure.
 
-An unknown or unsupported patch path falls back to the full test suite.
-The index is built from a clean checkout of the pinned sqlglot revision and does not use sample patches, test IDs or failure labels.
-
-To regenerate the index, run `python3 build_dependencies.py /path/to/sqlglot dependencies.json` with the pinned checkout.
-The Docker build copies the precomputed index, so the selector needs no network or sqlglot installation at runtime.
-
-To regenerate the trace, install `requirements.lock` in Python 3.13 using the starter Docker image, then run the tracer against a Git archive of the pinned revision.
-Pass an output path outside that source archive.
-
-```sh
-python trace_generator_methods.py /path/to/pinned-source /path/to/generator_coverage.json
-```
-
-## Probabilistic scheduling
-
-For trace-qualified edits, the planner gives every candidate test a failure probability based on the failure scenarios it belongs to.
-A changed generator symbol defines a shared cause among its observed callers.
-Missing coverage contributes one shared gap scenario and one additional scenario per test file.
-A group that loses several tests incurs one modeled risk for that cause.
-Across causes the model assumes independence and estimates the chance of any omitted failure as one minus the product of the probabilities that the relevant causes do not occur.
-These probabilities are conservative policy priors rather than measured or trained frequencies.
-
-The planner retains tests required by static evidence and considers a bounded set of omissions ordered by marginal risk per unit of duration.
-It compares worker assignments by estimated CI time plus 300 seconds times the probability of missing any failure.
-Sample answers are used only by the official benchmark.
+The scheduler tries up to eight worker counts and minimizes the official simulated cost.
+It fills spare capacity with additional tests, prioritizing consumers of the changed module.
 
 ## Submit
 
