@@ -235,6 +235,53 @@ class Impacts:
         self.module = False   # everything that uses the module
         self.import_check = False
         self.full = False
+        self.methods = []     # (class qualname, name): plain methods added to a class body
+        self.settings = []    # (class qualname, name, span): literal class attributes changed
+
+
+def plain_method(node):
+    """An undecorated def that no name-based dispatch in sqlglot can discover.
+
+    Generators and simplify collect `*_sql` methods with dir(), dunders and
+    capitalized names are protocol or settings hooks, so those stay class-level.
+    """
+    if not isinstance(node, DEF_TYPES):
+        return False
+    name = node.name
+    return (not node.decorator_list and not name.startswith("__")
+            and not name.endswith("_sql") and not name[:1].isupper())
+
+
+def literal_setting(b, n):
+    """Name of a class attribute whose literal value is all that changed, else None."""
+    if type(b) is not type(n) or not isinstance(b, (ast.Assign, ast.AnnAssign)):
+        return None
+    if isinstance(b, ast.Assign):
+        if len(b.targets) != 1 or len(n.targets) != 1:
+            return None
+        target, other = b.targets[0], n.targets[0]
+    else:
+        if b.value is None or n.value is None or dump(b.annotation) != dump(n.annotation):
+            return None
+        target, other = b.target, n.target
+    if not isinstance(target, ast.Name) or dump(target) != dump(other):
+        return None
+    try:
+        ast.literal_eval(b.value)
+        ast.literal_eval(n.value)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
+    return target.id
+
+
+def def_can_raise(node):
+    """Evaluating the def statement itself runs defaults and annotations."""
+    args = node.args
+    defaults = args.defaults + [d for d in args.kw_defaults if d is not None]
+    annotated = node.returns is not None or any(
+        a.annotation is not None for a in args.posonlyargs + args.args + args.kwonlyargs
+        + [x for x in (args.vararg, args.kwarg) if x is not None])
+    return annotated or not all(isinstance(d, ast.Constant) for d in defaults)
 
 
 class FileDiff:
@@ -320,7 +367,11 @@ class FileDiff:
             if header_dump(b) != header_dump(n):
                 bs = body_span(b.body) or span(b)
                 self.imp.lines.append(bs)
-                if ctx[0] != "func":
+                if ctx[0] != "func" and plain_method(b) and plain_method(n):
+                    # A new signature only matters to calls, and every call that
+                    # succeeded on the base ran the body. Defaults run at import.
+                    self.imp.import_check |= def_can_raise(n)
+                elif ctx[0] != "func":
                     self.class_level(ctx)
                 else:
                     self.imp.lines.append(span(b))
@@ -362,6 +413,11 @@ class FileDiff:
         if ctx[0] == "func":
             self.imp.lines.append(rng)
             return
+        name = literal_setting(b, n) if ctx[0] == "class" else None
+        if name:
+            # Resolved against the read sites of the name in setting_tests().
+            self.imp.settings.append((ctx[1], name, rng))
+            return
         # class or module level: only lambda bodies differ?
         bl, nl = lambdas(b), lambdas(n)
         if bl and len(bl) == len(nl) and masked_dump(b) == masked_dump(n):
@@ -378,6 +434,11 @@ class FileDiff:
     def removed(self, b, ctx):
         if ctx[0] == "func":
             self.imp.lines.append(span(b))
+            return
+        if ctx[0] == "class" and plain_method(b):
+            # Callers of a removed method, or of the override it shadowed, ran its body.
+            self.imp.lines.append(body_span(executable_body(b)) or span(b))
+            self.imp.import_check = True  # a class-body reference to it would now fail
             return
         if isinstance(b, DEF_TYPES + (ast.ClassDef,)):
             self.imp.lines.append(span(b))
@@ -398,6 +459,11 @@ class FileDiff:
             for s in stmts
         ):
             self.imp.import_check = True
+            return
+        if ctx[0] == "class" and all(plain_method(s) for s in stmts):
+            # Resolved against the base class hierarchy in method_tests().
+            self.imp.methods.extend((ctx[1], s.name) for s in stmts)
+            self.imp.import_check |= any(def_can_raise(s) for s in stmts)
             return
         self.class_level(ctx)
 
@@ -564,16 +630,114 @@ def passing_cases(ids):
             and not result.skipped and not result.expectedFailures)
 
 
-def check_patch(patched, probe=()):
+def state_fingerprint(ignore=frozenset()):
+    """Digest of everything sqlglot computes at import, per module.
+
+    Imports every sqlglot module, then describes module globals and the
+    attributes of classes defined there: literals, containers, enums, regexes,
+    partials and expression trees by value; functions, classes and modules by
+    name (their code is the patch itself and is covered by line impacts).
+    """
+    import enum
+    import functools
+    import hashlib
+    import importlib
+    import types
+
+    addr = re.compile(r" at 0x[0-9a-f]+")
+    for p in sorted((SRC / "sqlglot").rglob("*.py")):
+        name = module_name(p.relative_to(SRC).as_posix())
+        if not name.endswith("__main__"):
+            try:
+                importlib.import_module(name)
+            except Exception:  # noqa: BLE001 - absent modules compare as absent
+                pass
+
+    def describe(v, path):
+        t = type(v)
+        if v is None or t in (bool, int, float, str, bytes, complex):
+            return repr(v)
+        if isinstance(v, enum.Enum):
+            return f"{t.__qualname__}.{v.name}={v.value!r}"
+        if isinstance(v, type):
+            return f"<class {v.__module__}.{v.__qualname__}>"
+        if hasattr(v, "cache_info") and v.cache_info().currsize:
+            return f"<filled cache {id(v)}>"  # contents unknown: never compares equal
+        if isinstance(v, (types.FunctionType, types.BuiltinFunctionType, types.MethodType,
+                          types.ModuleType, classmethod, staticmethod, property)):
+            return f"<{t.__name__} {getattr(v, '__qualname__', getattr(v, '__name__', ''))}>"
+        if id(v) in path or len(path) > 40:
+            return "<cycle>"
+        path = path | {id(v)}
+        if isinstance(v, functools.partial):
+            return f"partial({describe(v.func, path)},{describe(v.args, path)},{describe(v.keywords, path)})"
+        if isinstance(v, re.Pattern):
+            return f"re({v.pattern!r},{v.flags})"
+        if isinstance(v, dict):
+            # Sorted: dicts built from sets of classes vary in order between processes.
+            return "{" + ",".join(sorted(f"{describe(k, path)}:{describe(x, path)}" for k, x in v.items())) + "}"
+        if isinstance(v, (list, tuple)):
+            items = [describe(x, path) for x in v]
+            if v and all(isinstance(x, type) for x in v):
+                # Class tuples are isinstance() targets, often built from sets.
+                items.sort()
+            return f"{t.__name__}[" + ",".join(items) + "]"
+        if isinstance(v, (set, frozenset)):
+            return f"{t.__name__}{{" + ",".join(sorted(describe(x, path) for x in v)) + "}"
+        if t.__module__.startswith("sqlglot.expressions"):
+            # Expression trees compare by structure, not by parent links,
+            # cached hashes or source positions.
+            return f"<{t.__qualname__} {addr.sub('', repr(v))}>"
+        slots = [n for k in t.__mro__ for n in getattr(k, "__slots__", ()) if isinstance(n, str)]
+        if slots and not callable(v):
+            values = {n: getattr(v, n, "<unset>") for n in slots if n not in ("__dict__", "__weakref__")}
+            if hasattr(v, "__dict__"):
+                values.update(vars(v))
+            return f"<{t.__module__}.{t.__qualname__} {describe(values, path)}>"
+        if hasattr(v, "__dict__") and not callable(v):
+            return f"<{t.__module__}.{t.__qualname__} {describe(vars(v), path)}>"
+        return f"<{t.__module__}.{t.__qualname__} {addr.sub('', repr(v))}>"
+
+    def describe_class(cls, out):
+        for k, x in vars(cls).items():
+            if k in ("__dict__", "__weakref__", "__doc__", "__module__"):
+                continue
+            if (cls.__module__, f"{cls.__qualname__}.{k}") in ignore:
+                continue
+            if isinstance(x, type) and x.__module__ == cls.__module__ and x.__qualname__.startswith(cls.__qualname__ + "."):
+                describe_class(x, out)
+            else:
+                out.append(f"{cls.__qualname__}.{k}={describe(x, frozenset())}")
+
+    digests = {}
+    for name in sorted(n for n in sys.modules if n == "sqlglot" or n.startswith("sqlglot.")):
+        module = sys.modules[name]
+        out = []
+        for k, v in list(vars(module).items()):
+            if k.startswith("__") and k != "__all__":
+                continue
+            if isinstance(v, type) and v.__module__ == name:
+                describe_class(v, out)
+            else:
+                out.append(f"{k}={describe(v, frozenset())}")
+        digests[name] = hashlib.sha256("\n".join(out).encode()).hexdigest()
+    return digests
+
+
+def check_patch(patched, probe=(), fingerprint=False, ignore=frozenset()):
     """Import sqlglot and every patched module from scratch, with all patched
-    sources visible together, in a forked child. False if it raises or hangs."""
+    sources visible together, in a forked child. False if it raises or hangs.
+
+    With fingerprint, return (status, digests of the resulting import-time state)."""
     mods = {module_name(p): (p, t) for p, t in patched.items()
             if p.startswith("sqlglot/") and p.endswith(".py")}
     if not mods:
-        return 0
+        return (0, None) if fingerprint else 0
     warm_imports()
     sys.stdout.flush()
     sys.stderr.flush()
+    if fingerprint:
+        read_end, write_end = os.pipe()
     pid = os.fork()
     if pid == 0:
         code = 1
@@ -617,6 +781,12 @@ def check_patch(patched, probe=()):
             for name in sorted(mods):
                 importlib.import_module(name)
             code = 0
+            if fingerprint:
+                os.close(read_end)
+                data = json.dumps(state_fingerprint(ignore)).encode()
+                while data:
+                    data = data[os.write(write_end, data):]
+                os.close(write_end)
             if probe:
                 os.chdir(SRC)
                 os.environ["SKIP_INTEGRATION"] = "0"
@@ -632,19 +802,146 @@ def check_patch(patched, probe=()):
         os._exit(code)
     import time
 
+    chunks = []
+    if fingerprint:
+        os.close(write_end)
+        os.set_blocking(read_end, False)
     deadline = time.monotonic() + IMPORT_DEADLINE
-    while True:
+    result = None
+    while result is None:
+        if fingerprint:
+            try:
+                while chunk := os.read(read_end, 1 << 16):
+                    chunks.append(chunk)
+            except BlockingIOError:
+                pass
         done, status = os.waitpid(pid, os.WNOHANG)
         if done:
-            return os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
-        if time.monotonic() > deadline:
+            result = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+        elif time.monotonic() > deadline:
             log("import check timed out")
             try:
                 os.kill(pid, 9)
             finally:
                 os.waitpid(pid, 0)
-            return -1
-        time.sleep(0.005)
+            result = -1
+        else:
+            time.sleep(0.005)
+    if not fingerprint:
+        return result
+    try:
+        while chunk := os.read(read_end, 1 << 16):
+            chunks.append(chunk)
+    except BlockingIOError:
+        pass
+    os.close(read_end)
+    try:
+        digests = json.loads(b"".join(chunks)) if result == 0 else None
+    except ValueError:
+        digests = None
+    return result, digests
+
+
+def import_state_unchanged(patched, ignore=frozenset()):
+    """True if importing all of sqlglot with the patch leaves every module-level
+    and class-level value as on the base, loading the same modules the same way."""
+    base = {}
+    for p in patched:
+        if p.startswith("sqlglot/") and p.endswith(".py"):
+            if not (SRC / p).is_file():
+                return False
+            base[p] = (SRC / p).read_text(encoding="utf-8")
+    before_status, before = check_patch(base, fingerprint=True, ignore=ignore)
+    after_status, after = check_patch(patched, fingerprint=True, ignore=ignore)
+    return before_status == 0 and after_status == 0 and before is not None and before == after
+
+
+# --------------------------------------------------------------------------- added methods
+
+_SOURCE_TEXT = []
+
+
+def named_in_source(name):
+    """True if sqlglot spells the name as a string, e.g. getattr(self, "name")."""
+    if not _SOURCE_TEXT:
+        _SOURCE_TEXT.append("\n".join(p.read_text(encoding="utf-8") for p in (SRC / "sqlglot").rglob("*.py")))
+    text = _SOURCE_TEXT[0]
+    return f'"{name}"' in text or f"'{name}'" in text
+
+
+def method_tests(index, path, qual, name):
+    """Tests that can run a plain method added to a base class, or None if unknown.
+
+    A new name is reachable only from changed callers, which are selected on
+    their own lines. A name that overrides an inherited method changes what
+    runs only for instances of this class that called the inherited method.
+    """
+    if path.startswith("tests/"):
+        # A new test method has no number in the inventory; helpers stay class-level.
+        return set() if name.startswith("test") else None
+    if not path.startswith("sqlglot/") or named_in_source(name):
+        return None
+    try:
+        import importlib
+        import inspect
+        import types
+
+        warm_imports()
+        obj = importlib.import_module(module_name(path))
+        for part in qual.split("."):
+            obj = getattr(obj, part)
+        if not isinstance(obj, type) or name in obj.__dict__:
+            return None
+        owner = next((k.__dict__[name] for k in obj.__mro__[1:] if name in k.__dict__), None)
+        if owner is None:
+            return set()
+        if not isinstance(owner, types.FunctionType):
+            return None
+        source = Path(inspect.getsourcefile(owner)).resolve()
+        rel = source.relative_to(SRC.resolve()).as_posix()
+    except Exception:  # noqa: BLE001 - unresolvable hierarchy: stay class-level
+        return None
+    code = owner.__code__
+    lines = {ln for *_, ln in code.co_lines() if ln is not None and ln != code.co_firstlineno}
+    if not lines or lines & index.lazy.get(rel, set()) or lines & index.imports.get(rel, set()):
+        return None
+    ran = set()
+    for ln in lines:
+        ran |= index.line_tests(rel, ln, ln)
+    return ran & (index.class_tests(module_name(path) + ":" + qual) | index.ref_tests(qual))
+
+
+_ATTRS = []
+
+
+def setting_tests(index, path, qual, name, deferred=None):
+    """Tests that read a literal class attribute, or None if a read is not traceable.
+
+    The value is only observable where the name is loaded. `self.NAME` reads it
+    from the instance's class hierarchy, so those sites count only for tests
+    that used this class; other forms (class objects, other instances) keep
+    every test that ran the site. Cached reads or the name spelled as a
+    string fall back to class-level impact. Import-time reads are appended to
+    `deferred`, to be accepted only if the import-time state is unchanged.
+    """
+    if not path.startswith("sqlglot/") or named_in_source(name):
+        return None
+    if not _ATTRS:
+        import marshal
+        attrs = APP / "attrs.marshal"
+        _ATTRS.append(marshal.loads(attrs.read_bytes()) if attrs.is_file() else None)
+    if _ATTRS[0] is None:
+        return None
+    users = index.class_tests(module_name(path) + ":" + qual) | index.ref_tests(qual)
+    out = set()
+    for f, ln, via_self in _ATTRS[0].get(name, ()):
+        if ln in index.lazy.get(f, ()) or (ln in index.imports.get(f, ()) and deferred is None):
+            return None
+        if ln in index.imports.get(f, ()):
+            deferred.append((f, ln))
+        ran = index.line_tests(f, ln, ln)
+        out |= (ran & users) if via_self else ran
+    return out
 
 
 # --------------------------------------------------------------------------- selection
@@ -659,7 +956,23 @@ def is_doc(path):
         path.endswith(DOC_SUFFIXES) and not path.startswith(("tests/", "sqlglot/")))
 
 
-def select(patch_text, index, all_tests):
+def select_patch(patch_text, index, all_tests):
+    """Select with the original conservative rules, then, if some impact was
+    widened only because it also runs at import time and importing the patch
+    leaves all import-time state as on the base, select again trusting that."""
+    index.deferred, index.patched, index.edited = False, {}, set()
+    chosen, why = select(patch_text, index, all_tests, trust_import_state=False)
+    if chosen and index.deferred and index.patched and import_state_unchanged(index.patched, frozenset(index.edited)):
+        narrow, why2 = select(patch_text, index, all_tests, trust_import_state=True)
+        # The narrowed set can add tests that read a setting through class
+        # objects, which class-level impact never covered; keep it if cheaper.
+        seconds = {t["number"]: t["seconds"] for t in index.tests}
+        if sum(seconds[t] for t in narrow) < sum(seconds[t] for t in chosen):
+            return narrow, why2 + ",import-state-same"
+    return chosen, why
+
+
+def select(patch_text, index, all_tests, trust_import_state=False):
     """Return (set of test numbers, reason) for one patch."""
     files = parse_patch(patch_text)
     if not files:
@@ -777,27 +1090,52 @@ def select(patch_text, index, all_tests):
         imp = fdiff.imp
         if path.startswith("sqlglot/"):
             index.extra |= index.module_tests(path)
-        if not (imp.lines or imp.lam_lines or imp.classes or imp.module or imp.import_check):
+        if not (imp.lines or imp.lam_lines or imp.classes or imp.module or imp.import_check or imp.methods
+                or imp.settings):
             reasons.append("ast-equal")
             continue
         patched[path] = new_text
         mod = module_name(path)
         lazy = index.lazy.get(path, set())
         imports = index.imports.get(path, set())
-        widen = False
+        widen = import_widen = False
         for lo, hi in imp.lines:
             chosen |= index.line_tests(path, lo, hi)
             rng = set(range(lo, hi + 1))
             if rng & lazy:
                 widen = True
             if rng & imports and not (imp.module or imp.classes):
-                # function body executed at import time: its effects are global
-                widen = True
+                # function body executed at import time: its effects can be global
+                import_widen = True
                 need_import_check = True
         for lo, hi in imp.lam_lines:
             chosen |= index.line_tests(path, lo, hi)
             if set(range(lo, hi + 1)) & lazy:
                 widen = True
+        for q, name, rng in imp.settings:
+            deferred = []
+            reached = setting_tests(index, path, q, name, deferred)
+            index.edited.add((module_name(path), f"{q}.{name}"))
+            if deferred and not trust_import_state:
+                # Read while importing: keep the class-level impact unless
+                # select_patch finds the import-time state identical to the base.
+                index.deferred = True
+                reached = None
+            if reached is None:
+                imp.lines.append(rng)
+                fdiff.class_level(("class", q))
+                reasons.append("setting-fallback")
+            else:
+                chosen |= reached
+                reasons.append("setting")
+        for q, name in imp.methods:
+            reached = method_tests(index, path, q, name)
+            if reached is None:
+                fdiff.class_level(("class", q))
+                reasons.append("method-fallback")
+            else:
+                chosen |= reached
+                reasons.append("method")
         if imp.classes:
             spans = class_spans(base_tree)
             for q in imp.classes:
@@ -811,6 +1149,12 @@ def select(patch_text, index, all_tests):
             # a test module or class body that changes can break collection of the
             # whole file and of every test file that imports it
             imp.module = True
+        if import_widen and not (imp.module or widen):
+            if path.startswith("sqlglot/") and trust_import_state:
+                pass  # import-time state was compared equal in select_patch
+            else:
+                widen = True
+                index.deferred |= path.startswith("sqlglot/")
         if imp.module or widen:
             chosen |= index.module_tests(path)
             if path.startswith("tests/"):
@@ -819,6 +1163,7 @@ def select(patch_text, index, all_tests):
             need_import_check = True
         reasons.append("code" + ("+class" if imp.classes else "") + ("+module" if imp.module else "")
                        + ("+widen" if widen else ""))
+    index.patched = patched
     if patched:
         probe = []
         if len(files) == 1 and not index.unknown and 1 < len(chosen) <= 8:
@@ -936,7 +1281,7 @@ def main():
     total_cost = 0
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
-            chosen, why = select(patch.read_text(encoding="utf-8", errors="replace"), index, all_tests)
+            chosen, why = select_patch(patch.read_text(encoding="utf-8", errors="replace"), index, all_tests)
             chosen |= set(index.unknown) if chosen and index.unknown else set()
         except Exception as e:  # noqa: BLE001 - never crash the batch; run everything
             chosen, why = set(all_tests), f"error {type(e).__name__}: {e}"

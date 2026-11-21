@@ -17,6 +17,8 @@ RUN mkdir -p /app/src \
  && chmod -R a+rX /app
 
 # Impact index recorded from the base test suite (tools/README.md).
+COPY tools/attr_index.py /app/attr_index.py
+RUN python /app/attr_index.py /app/src /app/attrs.marshal && chmod a+r /app/attrs.marshal
 COPY data/index.json.gz /app/index.json.gz
 COPY tools/to_marshal.py /app/to_marshal.py
 RUN python /app/to_marshal.py /app/index.json.gz /app/index.marshal && chmod a+r /app/index.*

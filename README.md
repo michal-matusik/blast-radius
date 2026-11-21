@@ -57,6 +57,17 @@ It skips the comparison only when the operators agree for every pair in the reco
 A custom equality method, missing observations, or a new test ID causes it to use ordinary impact selection.
 See [the tracing tools](tools/README.md) for the index generation procedure.
 
+A changed literal class attribute, such as a dialect flag, selects the tests that ran a line reading that name.
+Those read sites are indexed from the pinned sources at image build time (`tools/attr_index.py`).
+A `self.NAME` read only counts for tests that used the edited class or a subclass; other reads keep every test that ran them.
+Adding, removing or re-signing an undecorated method selects the tests that ran it or the inherited method it overrides, restricted to users of the class.
+Methods ending in `_sql`, dunders, capitalized names and names that sqlglot spells as strings stay class-level because sqlglot dispatches on those names.
+
+Some edited code also runs while sqlglot is imported, for example parser code that builds module constants.
+The selector first applies the original whole-module or whole-class rule.
+It then imports all of sqlglot with and without the patch in forked children and compares every module-level and class-level value.
+If nothing computed at import time differs, apart from the edited attribute itself, it selects again by lines and read sites, and keeps that result when it is cheaper.
+
 The scheduler tries up to eight worker counts and minimizes the official simulated cost.
 It fills spare capacity with additional tests, prioritizing consumers of the changed module.
 
